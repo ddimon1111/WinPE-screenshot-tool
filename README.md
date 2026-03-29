@@ -1,1 +1,0 @@
-# WinPE-screenshot-tool
