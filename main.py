@@ -29,9 +29,11 @@ APP_TITLE = "WinPE Security Center"
 SETTINGS_FILE = Path("settings.json")
 DEFAULT_SETTINGS = {
     "log_dir": str(Path.cwd() / "logs"),
+    "quarantine_dir": str(Path.cwd() / "quarantine"),
     "theme": "light",
     "autosave_logs": True,
     "vt_api_key": os.environ.get("VT_API_KEY", ""),
+    "safe_mode": "extended",
 }
 
 
@@ -45,6 +47,8 @@ class App(tk.Tk):
         self.settings = self.load_settings()
         self.log_dir = Path(self.settings["log_dir"])
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.quarantine_dir = Path(self.settings["quarantine_dir"])
+        self.quarantine_dir.mkdir(parents=True, exist_ok=True)
         self.session_log = self.log_dir / f"session_{datetime.now():%Y%m%d_%H%M%S}.txt"
 
         self.style = ttk.Style(self)
@@ -127,6 +131,8 @@ class App(tk.Tk):
         self.tab_usb = ttk.Frame(self.notebook)
         self.tab_key = ttk.Frame(self.notebook)
         self.tab_boot = ttk.Frame(self.notebook)
+        self.tab_scripts = ttk.Frame(self.notebook)
+        self.tab_safe_mode = ttk.Frame(self.notebook)
         self.tab_settings = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_vt, text="VirusTotal")
@@ -139,6 +145,8 @@ class App(tk.Tk):
         self.notebook.add(self.tab_usb, text="USB")
         self.notebook.add(self.tab_key, text="Анти-кейлоггер")
         self.notebook.add(self.tab_boot, text="Boot")
+        self.notebook.add(self.tab_scripts, text="Custom Scripts Runner")
+        self.notebook.add(self.tab_safe_mode, text="Safe Mode")
         self.notebook.add(self.tab_settings, text="Настройки")
 
         self.build_vt_tab()
@@ -151,7 +159,10 @@ class App(tk.Tk):
         self.build_usb_tab()
         self.build_keylogger_tab()
         self.build_boot_tab()
+        self.build_scripts_tab()
+        self.build_safe_mode_tab()
         self.build_settings_tab()
+        self.apply_safe_mode(self.settings.get("safe_mode", "extended"))
 
         ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w").pack(fill="x", padx=6, pady=(0, 6))
 
@@ -275,11 +286,11 @@ class App(tk.Tk):
 
     # ---------- System analysis ----------
     def build_system_tab(self):
-        ttk.Button(self.tab_system, text="Показать автозапуски HKLM/HKCU Run", command=self.show_autoruns).pack(
+        ttk.Button(self.tab_system, text="Показать все виды автозагрузки", command=self.show_all_autoruns).pack(
             anchor="w", padx=10, pady=10
         )
 
-    def show_autoruns(self):
+    def show_autoruns_registry(self):
         if not winreg:
             return self.log("Реестр недоступен (не Windows)", "unknown")
         paths = [
@@ -300,6 +311,49 @@ class App(tk.Tk):
                             break
             except Exception as e:
                 self.log(f"Ошибка {name}: {e}", "error")
+
+    def show_autoruns_scheduler(self):
+        self.log("Планировщик задач (schtasks):", "info")
+        self.run_cmd_async("schtasks /query /fo LIST /v")
+
+    def show_autoruns_services(self):
+        self.log("Службы (sc query):", "info")
+        self.run_cmd_async("sc query type= service state= all")
+
+    def show_autoruns_drivers(self):
+        self.log("Драйверы (driverquery):", "info")
+        self.run_cmd_async("driverquery /v")
+
+    def show_autoruns_shellex(self):
+        if not winreg:
+            return self.log("Shell-extensions недоступны (не Windows)", "unknown")
+        keys = [
+            r"Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved",
+            r"Software\Classes\*\shellex\ContextMenuHandlers",
+            r"Software\Classes\Directory\shellex\ContextMenuHandlers",
+        ]
+        for root, root_name in [(winreg.HKEY_LOCAL_MACHINE, "HKLM"), (winreg.HKEY_CURRENT_USER, "HKCU")]:
+            for kp in keys:
+                try:
+                    with winreg.OpenKey(root, kp) as key:
+                        self.log(f"Shell-extensions {root_name}\\{kp}", "info")
+                        idx = 0
+                        while True:
+                            try:
+                                n, v, _ = winreg.EnumValue(key, idx)
+                                self.log(f"{root_name}\\{kp}: {n} = {v}", "unknown")
+                                idx += 1
+                            except OSError:
+                                break
+                except Exception:
+                    continue
+
+    def show_all_autoruns(self):
+        self.show_autoruns_registry()
+        self.show_autoruns_scheduler()
+        self.show_autoruns_services()
+        self.show_autoruns_drivers()
+        self.show_autoruns_shellex()
 
     # ---------- Recovery ----------
     def build_recovery_tab(self):
@@ -427,6 +481,7 @@ class App(tk.Tk):
             ("Удалить", self.fm_delete),
             ("Копировать", self.fm_copy),
             ("VirusTotal Check", self.fm_vt),
+            ("Ручной Quarantine", self.fm_quarantine_manual),
         ]:
             ttk.Button(btns, text=t, command=cmd).pack(side="left", padx=3)
 
@@ -524,6 +579,25 @@ class App(tk.Tk):
         except Exception as e:
             self.log(f"FM VT ошибка: {e}", "error")
 
+    def quarantine_file(self, p: Path):
+        try:
+            self.quarantine_dir.mkdir(parents=True, exist_ok=True)
+            dst = self.quarantine_dir / f"{datetime.now():%Y%m%d_%H%M%S}_{p.name}"
+            shutil.move(str(p), str(dst))
+            self.log(f"Файл помещён в quarantine: {p} -> {dst}", "suspicious")
+            return True
+        except Exception as e:
+            self.log(f"Ошибка quarantine {p}: {e}", "error")
+            return False
+
+    def fm_quarantine_manual(self):
+        p = filedialog.askopenfilename(title="Выберите файл для карантина")
+        if not p:
+            return
+        src = Path(p)
+        if self.quarantine_file(src):
+            self.on_dir_change()
+
     # ---------- Internet ----------
     def build_internet_tab(self):
         pw = ttk.PanedWindow(self.tab_internet, orient="vertical")
@@ -560,6 +634,22 @@ class App(tk.Tk):
         sb.pack(fill="x", padx=6, pady=6)
         ttk.Button(sb, text="Старт Sniffer", command=self.start_sniffer).pack(side="left", padx=3)
         ttk.Button(sb, text="Стоп Sniffer", command=lambda: setattr(self, "sniffer_running", False)).pack(side="left", padx=3)
+
+        pscan = ttk.Labelframe(snf, text="Port Scanner")
+        pscan.pack(fill="x", padx=6, pady=(2, 6))
+        self.port_host_var = tk.StringVar(value="127.0.0.1")
+        self.port_start_var = tk.StringVar(value="1")
+        self.port_end_var = tk.StringVar(value="1024")
+        self.port_threads_var = tk.StringVar(value="200")
+        ttk.Label(pscan, text="Host").grid(row=0, column=0, padx=4, pady=4, sticky="w")
+        ttk.Entry(pscan, textvariable=self.port_host_var, width=18).grid(row=0, column=1, padx=4, pady=4)
+        ttk.Label(pscan, text="From").grid(row=0, column=2, padx=4, pady=4, sticky="w")
+        ttk.Entry(pscan, textvariable=self.port_start_var, width=8).grid(row=0, column=3, padx=4, pady=4)
+        ttk.Label(pscan, text="To").grid(row=0, column=4, padx=4, pady=4, sticky="w")
+        ttk.Entry(pscan, textvariable=self.port_end_var, width=8).grid(row=0, column=5, padx=4, pady=4)
+        ttk.Label(pscan, text="Workers").grid(row=0, column=6, padx=4, pady=4, sticky="w")
+        ttk.Entry(pscan, textvariable=self.port_threads_var, width=8).grid(row=0, column=7, padx=4, pady=4)
+        ttk.Button(pscan, text="Скан портов", command=self.start_port_scan).grid(row=0, column=8, padx=6, pady=4)
 
         self.load_hosts()
         self.refresh_connections()
@@ -642,6 +732,53 @@ class App(tk.Tk):
             self.log("Sniffer остановлен", "info")
 
         threading.Thread(target=run, daemon=True).start()
+
+    def start_port_scan(self):
+        host = self.port_host_var.get().strip()
+        try:
+            p1 = int(self.port_start_var.get())
+            p2 = int(self.port_end_var.get())
+            workers = max(1, int(self.port_threads_var.get()))
+        except ValueError:
+            return self.log("Port scanner: неверные параметры", "error")
+        if p1 < 1 or p2 > 65535 or p1 > p2:
+            return self.log("Port scanner: диапазон портов неверный", "error")
+        threading.Thread(target=self.port_scan_thread, args=(host, p1, p2, workers), daemon=True).start()
+
+    def port_scan_thread(self, host, p1, p2, workers):
+        import socket
+        from queue import Queue, Empty
+
+        self.log(f"Port scanner старт: {host} [{p1}-{p2}] workers={workers}", "info")
+        q = Queue()
+        for port in range(p1, p2 + 1):
+            q.put(port)
+        open_ports = []
+
+        def worker():
+            while True:
+                try:
+                    port = q.get_nowait()
+                except Empty:
+                    return
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.35)
+                try:
+                    if s.connect_ex((host, port)) == 0:
+                        open_ports.append(port)
+                        self.log(f"Port scanner: {host}:{port} OPEN", "suspicious")
+                except Exception:
+                    pass
+                finally:
+                    s.close()
+                q.task_done()
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.log(f"Port scanner завершён: открытых портов {len(open_ports)} ({open_ports[:50]})", "info")
 
     # ---------- USB ----------
     def build_usb_tab(self):
@@ -751,6 +888,89 @@ class App(tk.Tk):
             cmd = "wmic nicconfig where IPEnabled=true get Description,Index"
         self.run_cmd_async(cmd)
 
+    # ---------- Custom scripts ----------
+    def build_scripts_tab(self):
+        frm = ttk.Frame(self.tab_scripts)
+        frm.pack(fill="both", expand=True, padx=8, pady=8)
+        self.script_path_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.script_path_var).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(frm, text="Выбрать скрипт", command=self.pick_script).pack(side="left", padx=4)
+        ttk.Button(frm, text="Запустить", command=self.run_custom_script).pack(side="left", padx=4)
+
+    def pick_script(self):
+        p = filedialog.askopenfilename(
+            title="Выберите Python или PowerShell скрипт",
+            filetypes=[("Scripts", "*.py *.ps1"), ("All files", "*.*")],
+        )
+        if p:
+            self.script_path_var.set(p)
+
+    def run_custom_script(self):
+        p = Path(self.script_path_var.get().strip())
+        if not p.exists():
+            return self.log("Custom script: файл не найден", "error")
+        ext = p.suffix.lower()
+        if ext == ".py":
+            cmd = f'python "{p}"'
+        elif ext == ".ps1":
+            cmd = f'powershell -ExecutionPolicy Bypass -File "{p}"'
+        else:
+            return self.log("Custom script: поддерживаются только .py/.ps1", "unknown")
+        self.run_cmd_async(cmd)
+
+    # ---------- Safe mode ----------
+    def build_safe_mode_tab(self):
+        frm = ttk.Frame(self.tab_safe_mode)
+        frm.pack(fill="x", padx=10, pady=10)
+        ttk.Label(frm, text="Выбор режима запуска:").pack(anchor="w")
+        self.safe_mode_var = tk.StringVar(value=self.settings.get("safe_mode", "extended"))
+        for mode, text in [
+            ("minimal", "Минимальный (только базовые проверки)"),
+            ("extended", "Расширенный (все функции)"),
+            ("network", "Сетевой (сеть + интернет-инструменты)"),
+        ]:
+            ttk.Radiobutton(frm, text=text, value=mode, variable=self.safe_mode_var).pack(anchor="w", pady=2)
+        ttk.Button(frm, text="Применить режим", command=self.apply_safe_mode_from_ui).pack(anchor="w", pady=8)
+
+    def apply_safe_mode_from_ui(self):
+        mode = self.safe_mode_var.get()
+        self.settings["safe_mode"] = mode
+        self.apply_safe_mode(mode)
+        self.save_settings()
+        self.log(f"Safe Mode применён: {mode}", "clean")
+
+    def apply_safe_mode(self, mode):
+        def set_tab_state(tab, state):
+            try:
+                self.notebook.tab(tab, state=state)
+            except Exception:
+                pass
+
+        all_tabs = [
+            self.tab_vt,
+            self.tab_system,
+            self.tab_logs,
+            self.tab_recovery,
+            self.tab_tasks,
+            self.tab_filemgr,
+            self.tab_internet,
+            self.tab_usb,
+            self.tab_key,
+            self.tab_boot,
+            self.tab_scripts,
+            self.tab_safe_mode,
+            self.tab_settings,
+        ]
+        for t in all_tabs:
+            set_tab_state(t, "normal")
+
+        if mode == "minimal":
+            for t in [self.tab_internet, self.tab_usb, self.tab_boot, self.tab_scripts]:
+                set_tab_state(t, "hidden")
+        elif mode == "network":
+            for t in [self.tab_recovery, self.tab_boot]:
+                set_tab_state(t, "hidden")
+
     # ---------- Settings ----------
     def build_settings_tab(self):
         frm = ttk.Frame(self.tab_settings)
@@ -789,9 +1009,12 @@ class App(tk.Tk):
         self.settings["theme"] = self.theme_var.get()
         self.settings["autosave_logs"] = bool(self.autosave_var.get())
         self.settings["vt_api_key"] = self.vt_key_var.get().strip()
+        self.settings["safe_mode"] = self.settings.get("safe_mode", "extended")
 
         self.log_dir = Path(self.settings["log_dir"])
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.quarantine_dir = Path(self.settings.get("quarantine_dir", str(Path.cwd() / "quarantine")))
+        self.quarantine_dir.mkdir(parents=True, exist_ok=True)
         self.session_log = self.log_dir / f"session_{datetime.now():%Y%m%d_%H%M%S}.txt"
         self.save_settings()
         self.apply_theme(self.settings["theme"])
